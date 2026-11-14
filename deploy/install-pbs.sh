@@ -55,7 +55,17 @@ fi
 chown root:pbs-controller "$ENV_DIR/controller.env"
 chmod 0640 "$ENV_DIR/controller.env"
 
-cp -a "$SRC/controller" "$SRC/web" "$APP/"
+# Replace code completely, dropping stale files and checkout ownership/modes.
+rm -rf -- "$APP/controller" "$APP/web"
+for tree in controller web; do
+  install -d -m 0755 -o root -g root "$APP/$tree"
+  while IFS= read -r -d '' dir; do
+    install -d -m 0755 -o root -g root "$APP/$tree/${dir#"$SRC/$tree/"}"
+  done < <(find "$SRC/$tree" -mindepth 1 -type d -name __pycache__ -prune -o -type d -print0)
+  while IFS= read -r -d '' file; do
+    install -m 0644 -o root -g root "$file" "$APP/$tree/${file#"$SRC/$tree/"}"
+  done < <(find "$SRC/$tree" -type d -name __pycache__ -prune -o -type f ! -name '*.pyc' ! -name '*.pyo' -print0)
+done
 python3 -m venv "$APP/venv"
 "$APP/venv/bin/pip" install --disable-pip-version-check -r "$SRC/server-requirements.txt"
 
@@ -64,7 +74,7 @@ install -m 0644 "$SRC/deploy/pbs-truenas-backup.service" "$UNIT_DIR/pbs-truenas-
 
 # Limit the unprivileged API to these exact two root commands. No shell wildcard.
 cat > "$SUDOERS" <<'EOF'
-pbs-controller ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block pbs-truenas-backup.service, /usr/bin/systemctl stop pbs-truenas-backup.service
+pbs-controller ALL=(root) NOPASSWD: /usr/bin/systemctl start --no-block pbs-truenas-backup.service, /usr/bin/systemctl stop --no-block pbs-truenas-backup.service
 EOF
 chmod 0440 "$SUDOERS"
 if ! visudo -cf "$SUDOERS"; then
@@ -74,12 +84,13 @@ if ! visudo -cf "$SUDOERS"; then
 fi
 
 systemctl daemon-reload
-systemctl enable --now pbs-controller.service
+systemctl enable pbs-controller.service
+systemctl restart pbs-controller.service
 echo
 echo "Installed. Controller listens only at http://127.0.0.1:8765 on PBS."
 echo "No backup has been started."
 echo "Check: systemctl status pbs-controller.service"
-echo "For web access from a workstation: ssh -N -L 8765:127.0.0.1:8765 root@pbs"
+echo "For web access from a workstation: ssh -N -T -L 8765:127.0.0.1:8765 pbs-tunnel@pbs"
 if [[ -z "${TOKEN:-}" ]]; then
   echo "To view the existing token as root: cat $ENV_DIR/controller.env"
 fi

@@ -2,19 +2,39 @@
 from __future__ import annotations
 
 import os
+import signal
 import sqlite3
 import subprocess
 import threading
 import time
+from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 UNIT = "pbs-truenas-backup.service"
 SYSTEMCTL = "/usr/bin/systemctl"
 MAX_LOG_CHUNK = 65536
 INITIAL_TAIL = 131072
 ACTIVE_STATES = {"active", "activating", "deactivating"}
+START_GRACE_SECONDS = 60
+
+
+def signal_name(number: int | None) -> str | None:
+    if number is None:
+        return None
+    try:
+        return signal.Signals(number).name
+    except ValueError:
+        return f"SIG{number}"
+
+
+def systemd_timestamp(value: str) -> float | None:
+    """Parse systemctl --timestamp=us+utc without losing subsecond precision."""
+    try:
+        return datetime.fromisoformat(value.split(" ", 1)[1].replace(" UTC", "+00:00")).timestamp()
+    except (ValueError, IndexError):
+        return None
 
 
 class BusyError(Exception):
@@ -56,11 +76,17 @@ class Controller:
                 exit_code INTEGER,
                 message TEXT
             )""")
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(runs)")}
+            for name, kind in (("invocation_id", "TEXT"), ("invocation_started", "REAL"), ("signal", "INTEGER")):
+                if name not in columns:
+                    db.execute(f"ALTER TABLE runs ADD COLUMN {name} {kind}")
 
-    def _db(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(str(self.db_path), timeout=5)
-        connection.row_factory = sqlite3.Row
-        return connection
+    @contextmanager
+    def _db(self) -> Iterator[sqlite3.Connection]:
+        with closing(sqlite3.connect(str(self.db_path), timeout=5)) as connection:
+            connection.row_factory = sqlite3.Row
+            with connection:
+                yield connection
 
     def _last(self) -> dict[str, Any] | None:
         with self._db() as db:
@@ -70,7 +96,7 @@ class Controller:
     def _update(self, run_id: int, **fields: Any) -> None:
         if not fields:
             return
-        allowed = {"status", "finished", "exit_code", "message"}
+        allowed = {"status", "finished", "exit_code", "message", "invocation_id", "invocation_started", "signal"}
         if set(fields) - allowed:
             raise ValueError("Invalid history update")
         columns = ", ".join(f"{key} = ?" for key in fields)
@@ -95,10 +121,11 @@ class Controller:
     def _unit_state(self) -> dict[str, Any]:
         keys = (
             "LoadState,ActiveState,SubState,Result,ExecMainStatus,ExecMainCode,"
+            "InvocationID,ExecMainStartTimestamp,ExecMainExitTimestamp,"
             "ExecMainStartTimestampMonotonic,MainPID"
         )
         output = self._command(
-            [self.systemctl, "show", "--no-pager", f"--property={keys}", self.unit]
+            [self.systemctl, "show", "--no-pager", "--timestamp=us+utc", f"--property={keys}", self.unit]
         ).stdout
         props = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
         if props.get("LoadState") != "loaded":
@@ -106,9 +133,11 @@ class Controller:
         active_state = props.get("ActiveState", "unknown")
         running = active_state in ACTIVE_STATES
         try:
-            exit_code = int(props.get("ExecMainStatus", "") or "-1")
+            main_status = int(props.get("ExecMainStatus", "") or "-1")
+            main_code = int(props.get("ExecMainCode", "0") or "0")
         except ValueError:
-            exit_code = -1
+            main_status, main_code = -1, 0
+        killed_signal = main_status if main_code in {2, 3} and main_status > 0 else None
         try:
             start_microseconds = int(props.get("ExecMainStartTimestampMonotonic", "0"))
         except ValueError:
@@ -122,40 +151,63 @@ class Controller:
             "active_state": active_state,
             "sub_state": props.get("SubState", ""),
             "result": props.get("Result", ""),
-            "exit_code": exit_code if exit_code >= 0 else None,
+            "exit_code": main_status if main_code == 1 and main_status >= 0 else None,
+            "signal": killed_signal,
+            "signal_name": signal_name(killed_signal),
             "running": running,
             "elapsed_seconds": elapsed,
             "main_pid": int(props.get("MainPID", "0") or "0"),
-            "started_by_systemd": start_microseconds > 0,
+            "invocation_id": props.get("InvocationID") or None,
+            "started_at": systemd_timestamp(props.get("ExecMainStartTimestamp", "")),
+            "finished_at": systemd_timestamp(props.get("ExecMainExitTimestamp", "")),
         }
 
     def _reconcile(self, state: dict[str, Any]) -> dict[str, Any] | None:
         last = self._last()
         if not last or last["status"] not in {"starting", "running", "stopping"}:
             return last
+        started = state["started_at"]
+        if last["invocation_started"] is None:
+            # A previous invocation's retained success is never evidence of this start.
+            if started is None or not last["started"] <= started <= last["started"] + START_GRACE_SECONDS:
+                if time.time() >= last["started"] + START_GRACE_SECONDS:
+                    self._update(last["id"], status="failed", finished=last["started"] + START_GRACE_SECONDS,
+                                 message="Unit did not start")
+                return self._last()
+            self._update(last["id"], invocation_id=state["invocation_id"], invocation_started=started)
+            last = self._last()
+        elif (started != last["invocation_started"] or
+              (state["invocation_id"] and last["invocation_id"] and
+               state["invocation_id"] != last["invocation_id"])):
+            # systemd only retains the latest invocation. Do not borrow a manual run's result.
+            self._update(last["id"], status="failed", message="Systemd invocation changed; outcome unavailable")
+            return self._last()
+        elif state["invocation_id"] and not last["invocation_id"]:
+            self._update(last["id"], invocation_id=state["invocation_id"])
+            last["invocation_id"] = state["invocation_id"]
+
         if state["running"]:
             if last["status"] == "starting":
                 self._update(last["id"], status="running")
                 last["status"] = "running"
             return last
 
-        # systemctl start --no-block can return before systemd has run ExecStart.
-        if last["status"] == "starting" and time.time() - last["started"] < 4:
-            return last
-
+        finished = state["finished_at"]
+        if finished is not None and finished < started:
+            finished = None
         if last["status"] == "stopping":
             outcome = "interrupted"
         elif (
             state["result"] == "success"
             and state["exit_code"] == 0
-            and state["started_by_systemd"]
+            and finished is not None
         ):
             outcome = "completed"
         else:
             outcome = "failed"
         self._update(
-            last["id"], status=outcome, finished=time.time(),
-            exit_code=state["exit_code"],
+            last["id"], status=outcome, finished=finished,
+            exit_code=state["exit_code"], signal=state["signal"],
         )
         last = self._last()
         return last
@@ -172,6 +224,9 @@ class Controller:
             "log_offset": row["log_offset"],
             "log_file_id": row["log_file_id"],
             "exit_code": row["exit_code"],
+            "signal": row["signal"],
+            "signal_name": signal_name(row["signal"]),
+            "invocation_id": row["invocation_id"],
             "message": row["message"],
         }
 
@@ -220,13 +275,23 @@ class Controller:
     def stop(self) -> dict[str, str]:
         with self._lock:
             state = self._unit_state()
+            last = self._reconcile(state)
             if not state["running"]:
                 raise NotRunningError("No running backup to stop")
-            self._command([self.sudo, "-n", self.systemctl, "stop", self.unit])
-            last = self._last()
             if last and last["status"] in {"starting", "running"}:
-                self._update(last["id"], status="stopping")
+                self._update(last["id"], status="stopping", message=None)
+            try:
+                self._command([self.sudo, "-n", self.systemctl, "stop", "--no-block", self.unit])
+            except RuntimeError as exc:
+                if last and last["status"] in {"starting", "running"}:
+                    self._update(last["id"], status=last["status"], message=f"Stop request failed: {exc}")
+                raise
             return {"status": "stopping"}
+
+    def reconcile(self) -> None:
+        """Refresh history independently of clients; never starts or stops a backup."""
+        with self._lock:
+            self._reconcile(self._unit_state())
 
     def history(self, limit: int = 30) -> list[dict[str, Any]]:
         with self._lock:

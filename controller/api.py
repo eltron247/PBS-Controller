@@ -1,8 +1,13 @@
 """Token-authenticated HTTP API plus a shared, dependency-free web UI."""
 from __future__ import annotations
 
+import asyncio
+import logging
 import os
 import secrets
+import sqlite3
+import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Annotated
 
@@ -15,6 +20,14 @@ from .core import BusyError, Controller, NotRunningError
 
 ROOT = Path(__file__).resolve().parent.parent
 WEB = ROOT / "web"
+SECURITY_HEADERS = {
+    "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; "
+                               "img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; "
+                               "base-uri 'none'; form-action 'self'",
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+}
+RECONCILE_INTERVAL_SECONDS = 1
 
 
 class StopRequest(BaseModel):
@@ -29,17 +42,46 @@ def create_app(controller: Controller | None = None, token: str | None = None) -
         log_path=os.environ.get("PBS_CONTROLLER_LOG", "/var/log/run-pbs-job.log"),
         db_path=os.environ.get("PBS_CONTROLLER_DB", "/var/lib/pbs-controller/history.sqlite3"),
     )
+
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
+        stopping = threading.Event()
+
+        def refresh_history():
+            while not stopping.is_set():
+                try:
+                    engine.reconcile()
+                except (RuntimeError, OSError, sqlite3.Error):
+                    logging.getLogger(__name__).exception("History reconciliation failed; will retry")
+                stopping.wait(RECONCILE_INTERVAL_SECONDS)
+
+        worker = threading.Thread(target=refresh_history, name="history-reconcile", daemon=True)
+        worker.start()
+        try:
+            yield
+        finally:
+            stopping.set()
+            # _command is bounded to 12 seconds. Join off the event loop.
+            await asyncio.to_thread(worker.join)
+
     app = FastAPI(
         title="PBS Controller",
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
+        lifespan=lifespan,
     )
+
+    @app.middleware("http")
+    async def security_headers(request, call_next):
+        response = await call_next(request)
+        response.headers.update(SECURITY_HEADERS)
+        return response
 
     def authorized(authorization: Annotated[str | None, Header()] = None) -> None:
         prefix = "Bearer "
         provided = authorization[len(prefix):] if authorization and authorization.startswith(prefix) else ""
-        if not secrets.compare_digest(provided, key):
+        if not secrets.compare_digest(provided.encode("utf-8"), key.encode("utf-8")):
             raise HTTPException(status_code=401, detail="Invalid access token", headers={"WWW-Authenticate": "Bearer"})
 
     guard = [Depends(authorized)]
