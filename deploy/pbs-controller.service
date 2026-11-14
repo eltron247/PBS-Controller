@@ -1,0 +1,22 @@
+[Unit]
+Description=PBS Controller API and web interface
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+User=pbs-controller
+Group=pbs-controller
+WorkingDirectory=/opt/pbs-controller
+EnvironmentFile=/etc/pbs-controller/controller.env
+ExecStart=/opt/pbs-controller/venv/bin/uvicorn controller.api:app --host 127.0.0.1 --port 8765 --workers 1
+Restart=on-failure
+RestartSec=3
+UMask=0027
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/pbs-controller
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
