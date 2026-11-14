@@ -2,13 +2,15 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 const TOKEN_KEY = "pbs-controller-token";
-const MAX_CONSOLE_CHARS = 2000000;
+const MAX_CONSOLE_CHARS = 500000;
+const OMITTED = "[Earlier lines omitted from display; download log for complete run]\n";
+let consoleChars = 0;
+let omittedMarker = null;
 let token = sessionStorage.getItem(TOKEN_KEY) || "";
 let offset = null;
 let fileId = null;
 let currentState = null;
 let polling = false;
-let logTick = 0;
 let authenticated = false;
 
 function asTime(iso) {
@@ -21,6 +23,11 @@ function duration(s) {
   const m = String(Math.floor((s % 3600) / 60)).padStart(2, "0");
   const sec = String(s % 60).padStart(2, "0");
   return h + ":" + m + ":" + sec;
+}
+function exitStatus(run) {
+  if (!run) return "—";
+  if (run.signal != null) return "signal " + (run.signal_name || run.signal);
+  return run.exit_code == null ? "—" : "exit " + run.exit_code;
 }
 async function api(path, options) {
   const opts = Object.assign({ cache: "no-store" }, options || {});
@@ -77,29 +84,54 @@ function setStatus(data) {
   $("state-dot").className = "state-dot " + (running ? "running" : outcome);
   $("job-detail").textContent = running
     ? "Backup process active on PBS"
-    : (run ? "Last controller job: " + run.status : "Systemd service is idle");
+    : (run ? "Last controller job: " + run.status + (run.message ? " · " + run.message : "") : "Systemd service is idle");
   $("elapsed").textContent = running ? duration(sys.elapsed_seconds) :
     (run && run.finished_at ? duration((Date.parse(run.finished_at) - Date.parse(run.started_at)) / 1000) : "—");
   $("last-started").textContent = run ? asTime(run.started_at) : "—";
   $("last-outcome").textContent = run ? "Run #" + run.id + " · " + run.status : "No controller runs recorded";
   $("exit-status").textContent = running ? "—" :
-    (run && run.exit_code !== null ? String(run.exit_code) : "—");
+    exitStatus(run || sys);
   $("log-path").textContent = data.log_path;
   $("start").disabled = running || status === "starting" || (run && ["starting", "stopping"].includes(run.status));
   $("stop").disabled = !running;
   $("download").disabled = false;
   $("footer-state").textContent = sys.sub_state + " / " + (sys.result || "unknown");
 }
+function resetConsole(text = "") {
+  $("console").textContent = text;
+  consoleChars = text.length;
+  omittedMarker = null;
+}
 function appendConsole(text) {
   const consoleView = $("console");
   const follow = $("follow").checked;
+  const oldTop = consoleView.scrollTop;
   const wasBottom = consoleView.scrollTop + consoleView.clientHeight >= consoleView.scrollHeight - 50;
   if (text) {
-    consoleView.textContent += text;
-    if (consoleView.textContent.length > MAX_CONSOLE_CHARS) {
-      consoleView.textContent = "[Earlier lines omitted from display; download log for complete run]\n" +
-        consoleView.textContent.slice(-MAX_CONSOLE_CHARS);
+    const node = document.createTextNode("");
+    node.textContent = text;
+    consoleView.appendChild(node);
+    consoleChars += text.length;
+    const oldHeight = consoleView.scrollHeight;
+    let trimmed = false;
+    while (consoleChars > MAX_CONSOLE_CHARS) {
+      const first = omittedMarker ? omittedMarker.nextSibling : consoleView.firstChild;
+      const excess = consoleChars - MAX_CONSOLE_CHARS;
+      if (first.textContent.length <= excess) {
+        consoleChars -= first.textContent.length;
+        first.remove();
+      } else {
+        first.deleteData(0, excess);
+        consoleChars -= excess;
+      }
+      trimmed = true;
     }
+    if (trimmed && !omittedMarker) {
+      omittedMarker = document.createTextNode("");
+      omittedMarker.textContent = OMITTED;
+      consoleView.prepend(omittedMarker);
+    }
+    if (trimmed && !(follow && wasBottom)) consoleView.scrollTop = oldTop - (oldHeight - consoleView.scrollHeight);
   }
   if (follow && wasBottom) consoleView.scrollTop = consoleView.scrollHeight;
 }
@@ -111,7 +143,7 @@ async function pollLog() {
     if (offset !== null) params.set("offset", String(offset));
     if (fileId !== null) params.set("file_id", fileId);
     result = await json("/api/log?" + params.toString());
-    if (result.reset) $("console").textContent = "[Log file changed or truncated; resumed from current file]\n";
+    if (result.reset) resetConsole("[Log file changed or truncated; resumed from current file]\n");
     offset = result.offset;
     fileId = result.file_id;
     appendConsole(result.text);
@@ -127,7 +159,7 @@ async function poll() {
   try {
     const data = await json("/api/status");
     setStatus(data);
-    if (++logTick % 1 === 0) await pollLog();
+    await pollLog();
     connected(true);
   } catch (err) {
     showError(err);
@@ -143,7 +175,7 @@ async function signIn(candidate) {
     authenticated = true;
     sessionStorage.setItem(TOKEN_KEY, token);
     $("login-overlay").hidden = true;
-    $("console").textContent = "";
+    resetConsole();
     offset = null;
     fileId = null;
     setStatus(data);
@@ -161,7 +193,7 @@ $("start").addEventListener("click", async function () {
   $("start").disabled = true;
   try {
     const result = await json("/api/start", { method: "POST" });
-    $("console").textContent = "";
+    resetConsole();
     offset = result.log_offset;
     fileId = result.log_file_id;
     $("console-status").textContent = "Backup start requested · waiting for output…";
@@ -187,7 +219,7 @@ $("stop").addEventListener("click", async function () {
   }
 });
 $("clear").addEventListener("click", function () {
-  $("console").textContent = "";
+  resetConsole();
   $("console-status").textContent = "Display cleared (server log unchanged)";
 });
 $("history-toggle").addEventListener("click", async function () {
@@ -211,7 +243,7 @@ $("history-toggle").addEventListener("click", async function () {
       status.textContent = run.status;
       status.className = "status-" + run.status;
       const code = document.createElement("span");
-      code.textContent = run.exit_code === null ? "—" : "exit " + run.exit_code;
+      code.textContent = exitStatus(run);
       row.append(id, date, status, code);
       list.append(row);
     });

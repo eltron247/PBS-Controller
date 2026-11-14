@@ -1,4 +1,6 @@
 name: Controller CI
+permissions:
+  contents: read
 on:
   push:
     branches: [main]
@@ -7,7 +9,10 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -17,8 +22,10 @@ jobs:
       - run: python -m unittest discover -s tests -v
         env:
           PBS_CONTROLLER_TOKEN: test-token-must-be-at-least-thirty-two-characters-long
-          PBS_CONTROLLER_DB: /tmp/pbs-controller-ci.sqlite3
+          PBS_CONTROLLER_DB: ${{ runner.temp }}/pbs-controller-ci.sqlite3
       - run: python -m compileall -q controller desktop
+      - run: bash -n deploy/install-pbs.sh
+        if: runner.os == 'Linux'
 
   windows-exe:
     runs-on: windows-latest
