@@ -1,0 +1,17 @@
+[Unit]
+Description=TrueNAS ingest into Proxmox Backup Server
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=exec
+User=root
+Group=root
+WorkingDirectory=/root
+Environment=HOME=/root
+ExecStart=/usr/bin/flock -n /run/lock/pbs-truenas-backup.lock /usr/local/sbin/truenas-backup.sh
+StandardOutput=append:/var/log/run-pbs-job.log
+StandardError=append:/var/log/run-pbs-job.log
+KillMode=control-group
+TimeoutStopSec=45
+Restart=no

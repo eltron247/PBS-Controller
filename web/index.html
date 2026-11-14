@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>PBS Controller</title>
+  <link rel="stylesheet" href="/assets/style.css">
+  <script defer src="/assets/app.js"></script>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i></span>
+        <div><strong>PBS<span>CONTROL</span></strong><small>TRUENAS INGEST CONSOLE</small></div>
+      </div>
+      <div class="connection"><span class="signal" id="connection-indicator"></span><span id="connection-text">Not connected</span></div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div>
+          <p class="eyebrow">BACKUP OPERATIONS <span class="separator">/</span> MANUAL INGEST</p>
+          <h1>TrueNAS <span class="arrow">→</span> Proxmox Backup Server</h1>
+          <p class="subtitle">Launch the existing backup job. Follow its output in this window, even after reconnecting.</p>
+        </div>
+        <div class="server-badge"><span class="server-dot"></span><div><b>Target</b><span>pbs · local service</span></div></div>
+      </section>
+
+      <section class="summary" aria-label="Backup state">
+        <article class="status-card">
+          <div class="label">CURRENT JOB</div>
+          <div class="state-line"><span class="state-dot" id="state-dot"></span><span class="state" id="job-state">CONNECT TO BEGIN</span></div>
+          <div class="subline" id="job-detail">Waiting for controller authentication</div>
+        </article>
+        <article class="metric"><div class="label">ELAPSED</div><div class="metric-value" id="elapsed">—</div><div class="muted">Systemd-observed duration</div></article>
+        <article class="metric"><div class="label">LATEST RUN</div><div class="metric-value small" id="last-started">—</div><div class="muted" id="last-outcome">No history loaded</div></article>
+        <article class="metric"><div class="label">EXIT STATUS</div><div class="metric-value" id="exit-status">—</div><div class="muted">Script return code</div></article>
+      </section>
+
+      <section class="actionbar">
+        <div><button class="btn btn-primary" id="start" disabled><span class="play-icon">▶</span> START BACKUP</button>
+          <button class="btn btn-danger" id="stop" disabled>■&nbsp; STOP</button></div>
+        <div><button class="btn btn-ghost" id="history-toggle">↗ RUN HISTORY</button>
+          <button class="btn btn-ghost" id="download" disabled>↓ DOWNLOAD LOG</button></div>
+      </section>
+
+      <section id="history-panel" class="history-panel" hidden>
+        <div class="panel-heading"><strong>RECENT CONTROLLER RUNS</strong><button id="history-close" class="icon-button" aria-label="Close history">✕</button></div>
+        <div id="history-list" class="history-list">No runs recorded.</div>
+      </section>
+
+      <section class="terminal-panel">
+        <div class="terminal-head">
+          <div class="terminal-heading"><span class="terminal-icon">_</span><div><strong>LIVE CONSOLE</strong><small id="log-path">/var/log/run-pbs-job.log</small></div></div>
+          <div class="terminal-actions"><span class="live-indicator"><span></span> LIVE</span><label class="follow-label"><input type="checkbox" id="follow" checked> Auto-follow</label>
+            <button id="clear" class="icon-button" title="Clear this display (not the server log)">Clear</button></div>
+        </div>
+        <pre id="console" class="console" role="log" aria-live="off"><span>Connect to PBS to view the log.</span></pre>
+        <div class="terminal-footer"><span id="console-status">Waiting for connection</span><span>Console text is authoritative; progress metrics depend on script output.</span></div>
+      </section>
+      <footer>Powered by your existing <code>truenas-backup.sh</code> · <span id="footer-state">No active session</span></footer>
+    </main>
+  </div>
+
+  <div class="login-overlay" id="login-overlay">
+    <form class="login-card" id="login-form">
+      <span class="lock-icon">◇</span>
+      <p class="eyebrow">CONTROLLER ACCESS</p>
+      <h2>Connect to PBS</h2>
+      <p>The controller uses a private access token. Enter the token printed by the PBS installer.</p>
+      <label for="token">ACCESS TOKEN</label>
+      <input type="password" name="token" id="token" autocomplete="off" placeholder="Paste controller token" required>
+      <p class="form-error" id="login-error" role="alert"></p>
+      <button type="submit" class="btn btn-primary login-button">CONNECT →</button>
+      <small>Stored only in this window's session storage, never in the URL.</small>
+    </form>
+  </div>
+</body>
+</html>
